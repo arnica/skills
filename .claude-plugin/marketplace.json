@@ -1,0 +1,16 @@
+{
+  "name": "arnica",
+  "owner": {
+    "name": "Arnica",
+    "url": "https://arnica.io"
+  },
+  "plugins": [
+    {
+      "name": "arnica-security",
+      "source": "./",
+      "description": "Arnica security skills: API reference and code-finding triage. Use when calling the Arnica API or reviewing, triaging, fixing, or dismissing Arnica security findings.",
+      "category": "security",
+      "keywords": ["arnica", "security", "sast", "sca", "findings", "triage"]
+    }
+  ]
+}

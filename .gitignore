@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# Arnica API tokens / secrets — never commit
+.arnica/
+*.env
+.prod.env
+.staging.env

@@ -1,0 +1,16 @@
+{
+  "name": "arnica-security",
+  "description": "Arnica security skills: API reference and code-finding triage. Use when calling the Arnica API or reviewing, triaging, fixing, or dismissing Arnica security findings.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Arnica",
+    "url": "https://arnica.io"
+  },
+  "repository": "https://github.com/arnica/skills",
+  "license": "MIT",
+  "keywords": ["arnica", "security", "sast", "sca", "findings", "triage"],
+  "skills": [
+    "./skills/arnica-api",
+    "./skills/arnica-fix"
+  ]
+}
