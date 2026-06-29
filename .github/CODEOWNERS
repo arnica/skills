@@ -3,10 +3,4 @@
 # from a designated owner. Keeps the published plugin trustworthy.
 
 # Default owner for everything
-*                       @orenkatz @ofirshtrull @nir-valtman @eran-medan
-
-# Skill content + plugin manifests are the security-sensitive supply-chain surface
-/skills/                @orenkatz @ofirshtrull @nir-valtman @eran-medan
-/.claude-plugin/        @orenkatz @ofirshtrull @nir-valtman @eran-medan
-/.cursor-plugin/        @orenkatz @ofirshtrull @nir-valtman @eran-medan
-/.github/               @orenkatz @ofirshtrull @nir-valtman @eran-medan
+*                       @arnica/skills-maintainers
