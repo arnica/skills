@@ -1,1 +1,12 @@
-* @arnica/skills-maintainers
+# Code owners for arnica/skills
+# Any change to skill content (what clients' agents execute) requires review
+# from a designated owner. Keeps the published plugin trustworthy.
+
+# Default owner for everything
+*                       @orenkatz @ofirshtrull @nir-valtman @eran-medan @arnica/skills-maintainers
+
+# Skill content + plugin manifests are the security-sensitive supply-chain surface
+/skills/                @orenkatz @ofirshtrull @nir-valtman @eran-medan @arnica/skills-maintainers
+/.claude-plugin/        @orenkatz @ofirshtrull @nir-valtman @eran-medan @arnica/skills-maintainers
+/.cursor-plugin/        @orenkatz @ofirshtrull @nir-valtman @eran-medan @arnica/skills-maintainers
+/.github/               @orenkatz @ofirshtrull @nir-valtman @eran-medan @arnica/skills-maintainers
