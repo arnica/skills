@@ -62,7 +62,7 @@ instead of `source`-ing the file. This avoids leaking unrelated env vars and
 works identically in `arnica-fix`:
 
 ```bash
-TOKEN=$(grep '^TOKEN=' ~/.arnica/.prod.env | cut -d= -f2)
+TOKEN=$(grep '^TOKEN=' ~/.arnica/.prod.env | cut -d= -f2-)
 curl -sS -H "Authorization: Bearer $TOKEN" https://api.app.arnica.io/v1/auth/token
 ```
 
