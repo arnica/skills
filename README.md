@@ -20,7 +20,7 @@ reference, auth, pagination, and status semantics.
 
 ### Cursor
 
-**From the Marketplace:**
+**From the Marketplace: (Coming soon)**
 
 1. Open **Cursor → Customize** (or browse [cursor.com/marketplace](https://cursor.com/marketplace)).
 2. Search for **`arnica`** (or `arnica-security`).
