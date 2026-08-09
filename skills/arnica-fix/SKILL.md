@@ -45,7 +45,7 @@ edit code or call the dismiss/status API without the user's explicit go-ahead.**
   full endpoint reference, error model, and pagination semantics.
 - Token loading convention (matches `arnica-api`):
   ```bash
-  TOKEN=$(grep '^TOKEN=' ~/.arnica/.prod.env | cut -d= -f2)
+  TOKEN=$(grep '^TOKEN=' ~/.arnica/.prod.env | cut -d= -f2-)
   ```
 
 ## Building the `asset` query parameter
@@ -431,7 +431,7 @@ This skips findings that are already dismissed, resolved, or in-progress —
 avoiding re-triaging work that's already been done.
 
 ```bash
-TOKEN=$(grep '^TOKEN=' ~/.arnica/.prod.env | cut -d= -f2)
+TOKEN=$(grep '^TOKEN=' ~/.arnica/.prod.env | cut -d= -f2-)
 # IMPORTANT: URL-encode $ASSET — see the asset-encoding callout in Step 0.
 ASSET_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$ASSET")
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -475,7 +475,7 @@ Subagent prompt template (parameterize `<PAGE>`, `<SEVERITY>`, `<TYPE>`,
 
 ```
 Fetch page <PAGE> of Arnica findings:
-  curl -s -H "Authorization: Bearer $(grep '^TOKEN=' ~/.arnica/.prod.env | cut -d= -f2)" \
+  curl -s -H "Authorization: Bearer $(grep '^TOKEN=' ~/.arnica/.prod.env | cut -d= -f2-)" \
     "https://api.app.arnica.io/v1/risks/findings?asset=<ASSET_ENC>&severity=<SEVERITY>&type=<TYPE>&status=requires_review&expand=true&limit=20&page=<PAGE>"
 For each finding: read the file at asset.path, correlate to lineNumber, and
 classify per the arnica-fix skill's "Step 3" rules. Return the structured
