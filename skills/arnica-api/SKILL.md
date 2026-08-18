@@ -62,9 +62,17 @@ instead of `source`-ing the file. This avoids leaking unrelated env vars and
 works identically in `arnica-fix`:
 
 ```bash
-TOKEN=$(grep '^TOKEN=' ~/.arnica/.prod.env | cut -d= -f2)
+TOKEN=$(sed -n 's/^TOKEN=//p' ~/.arnica/.prod.env)
 curl -sS -H "Authorization: Bearer $TOKEN" https://api.app.arnica.io/v1/auth/token
 ```
+
+> **Do not use `cut -d= -f2` to extract the token.** Arnica tokens are
+> base64-encoded and frequently end in `=` or `==` padding; `cut -d= -f2` splits
+> on `=` and keeps only the second field, silently dropping the padding. That
+> yields a truncated token that Arnica rejects with a generic `403 Forbidden` —
+> the same response as an invalid/expired key, so the failure looks like an auth
+> problem rather than a parsing bug. `sed -n 's/^TOKEN=//p'` strips only the
+> leading `TOKEN=` prefix and preserves the rest of the line verbatim.
 
 This keeps auth credentials separate from code and makes it easy to reuse the
 token in scripts.
@@ -411,6 +419,245 @@ Content-Type: application/json
 GET /v1/status-checks/{id}
 ```
 
+### 9. Audit Events
+
+Read-only audit log of actions taken in your Arnica org (who did what, when, and
+through which interface). Useful for SIEM ingestion, compliance exports, and
+answering "who changed this policy / product / integration".
+
+#### List Audit Events
+```bash
+GET /v1/audit-events
+
+# Query parameters (from the live OpenAPI schema):
+# - limit:     items per page (default 50, min 1, max 100)
+# - offset:    number of matching events to skip (default 0, max 999999)
+# - startDate: inclusive lower timestamp boundary, ISO 8601 date or datetime
+#              (e.g. 2026-08-03T00:00:00Z or 2026-08-03)
+# - endDate:   inclusive upper timestamp boundary, ISO 8601 date or datetime
+#              (e.g. 2026-08-03T23:59:59.999Z)
+# - userId:    actor EMAIL address to match (repeat to match any of several)
+# - eventType: event DOMAIN to match (repeat to match any of several) — one of
+#              AUTHENTICATION | AUTHORIZATION | POLICY | PRODUCT | INTEGRATION |
+#              API | AI | INVENTORY
+# - eventAction: action to match (repeat to match any) — one of
+#              CREATE | READ | UPDATE | DELETE | LOGIN | LOGOUT
+# - sortBy:    only "timestamp" (the default) is supported
+# - sortDesc:  newest first when true (default true)
+#
+# Requires scope: audit:read
+```
+
+> Returns a **wrapped** object `{ "items": [...], "total": <number> }`, where
+> `total` is the count of all events matching the filters *before* pagination —
+> so unlike `/v1/risks/findings`, you can paginate against a known total.
+>
+> **Pagination naming**: audit-events uses `offset`/`limit` (like `/v1/products`),
+> **not** `page`/`limit` (which `/v1/risks/findings` uses).
+>
+> **Repeatable filters**: repeat `userId`, `eventType`, or `eventAction` to match
+> *any* of the supplied values (OR semantics). Date boundaries are inclusive.
+>
+> **Auth note (differs from the rest of the API)**: a *missing* API key returns
+> `401`, while an *invalid* key or one missing the `audit:read` scope returns
+> `403`. Everywhere else Arnica collapses both into `403` — audit-events is the
+> exception that actually emits `401`. Distinguish invalid-key from
+> missing-scope by the response body's `message`: missing scope returns
+> `"Missing required scope(s): [audit:read]"`, invalid key returns a plain
+> `"Forbidden"`.
+>
+> **Self-referential logging (footgun)**: every call to `GET /v1/audit-events`
+> writes itself into the audit log as
+> `{ eventAction: "READ", eventDomain: "AUTHORIZATION", resourceType: "AuditEventList", resourceName: "Audit Events", newValue: { eventCount: <n> } }`,
+> where `eventCount` is the number of items the caller received (0 on an empty
+> page). Consequences:
+> - A polling job will fill the log with its own reads. Poll infrequently, and
+>   attribute reads to a dedicated API key (`apiTokenName`) so you can identify
+>   and post-filter them.
+> - "Show me recent activity" queries will surface the querier's own calls at
+>   the top. Either post-filter client-side (drop items where
+>   `resourceType == "AuditEventList"`) or query for state-changing actions
+>   only using repeated `eventAction` filters (see the recipe below).
+> - You cannot suppress these entries server-side via `eventType=` alone —
+>   `AUTHORIZATION` also covers other authorization events you may care about.
+
+Example — all state-changing activity in a date window (excludes every `READ`,
+which drops both the self-referential audit-log reads *and* other read events),
+newest first:
+
+```bash
+curl -sS -H "Authorization: Bearer $ARNICA_API_TOKEN" \
+  "https://api.app.arnica.io/v1/audit-events?eventAction=CREATE&eventAction=UPDATE&eventAction=DELETE&eventAction=LOGIN&eventAction=LOGOUT&startDate=2026-08-01&endDate=2026-08-18T23:59:59.999Z&limit=100"
+```
+
+Example — narrower: only policy and integration UPDATEs made via the API:
+
+```bash
+curl -sS -H "Authorization: Bearer $ARNICA_API_TOKEN" \
+  "https://api.app.arnica.io/v1/audit-events?eventType=POLICY&eventType=INTEGRATION&eventAction=UPDATE&startDate=2026-08-01&endDate=2026-08-18T23:59:59.999Z&limit=100"
+```
+
+Each item (`AuditEventDto`) has this shape (all fields present; nullable ones may
+be `null`):
+
+```json
+{
+  "id": "123e4567-e89b-12d3-a456-426614174000",
+  "timestamp": "2026-08-03T14:30:00.000Z",
+  "eventAction": "UPDATE",
+  "eventDomain": "PRODUCT",
+  "interactionType": "API",
+  "user": "security.engineer@example.com",
+  "userDisplayName": "Security Engineer",
+  "resourceType": "Product",
+  "resourceId": "b1e0f1c2-9d1a-4a4e-9d8a-8b3f5b7a1234",
+  "resourceName": "Payments Platform",
+  "oldValue": { },
+  "newValue": { },
+  "apiTokenName": "siem-ingestion"
+}
+```
+
+> Field notes:
+> - `eventAction` uses the action enum above; the response field for the domain
+>   is `eventDomain` (the *query* parameter that filters it is named `eventType`
+>   — the names differ between request and response).
+> - `interactionType` is `WEB` or `API` — the interface the action came through.
+> - `user` is the actor's email; `userDisplayName` may be `null`.
+> - `oldValue` / `newValue` are **full before/after snapshots** of the resource,
+>   not a computed diff. To find what actually changed you have to diff them
+>   yourself (e.g. `json.dumps(old, sort_keys=True) != json.dumps(new, sort_keys=True)`
+>   for a cheap change-check, or `difflib.unified_diff` on canonicalized JSON
+>   for a field-level view). For `AUTHENTICATION` events (`LOGIN` / `LOGOUT`)
+>   both fields are always `null`.
+> - **No-op UPDATE events happen** — clicking "Save" in the web UI without
+>   changing anything still writes an `UPDATE` audit entry with
+>   `oldValue == newValue`. In a real org sample, ~25% of `POLICY` UPDATEs
+>   were no-ops. If you're driving a change-tracking dashboard, filter out
+>   `oldValue == newValue` client-side.
+> - `apiTokenName` is the *name* of the API key used (e.g. `"skill2"`), not the
+>   token value. It is `null` when the action came through the web UI.
+> - `resourceId` semantics depend on `resourceType`:
+>   - `Policy` → the `PolicySubType` slug (`code_risk`, `secrets`, `global`) —
+>     **not** a UUID. Same identifiers as `GET /v1/policies/{subType}`.
+>   - `Product` → the product UUID.
+>   - `API Key` → the key's name (e.g. `"skill2"`).
+>   - `User` → the actor's email.
+>   - `AuditEventList` → the Arnica org id.
+> - `resourceName` is best-effort human-readable and is often `null` — e.g. for
+>   `POLICY` events it was `null` on nearly every historical event in a live
+>   sample; Arnica only recently started populating it (Aug 2026) with values
+>   like `"Code Risk"`. Never rely on it as a stable filter key — use
+>   `resourceType` + `resourceId` instead.
+
+#### Common event shapes
+
+Concrete examples of the most common event types, taken from a live response.
+Use these when writing SIEM parsers or dashboards so you know which fields to
+expect populated vs. `null`.
+
+**API key created (via WEB)** — `newValue` records the granted scopes; the
+`createdBy` field is a redacted email:
+
+```json
+{
+  "eventAction": "CREATE",
+  "eventDomain": "API",
+  "interactionType": "WEB",
+  "user": "admin@example.com",
+  "resourceType": "API Key",
+  "resourceId": "skill2",
+  "resourceName": null,
+  "oldValue": null,
+  "newValue": {
+    "name": "skill2",
+    "scopes": ["risks:read", "audit:read", "products:write"],
+    "createdBy": "admi***@***le.com"
+  },
+  "apiTokenName": null
+}
+```
+
+**Interactive login (via WEB)** — auth events carry no diff:
+
+```json
+{
+  "eventAction": "LOGIN",
+  "eventDomain": "AUTHENTICATION",
+  "interactionType": "WEB",
+  "user": "admin@example.com",
+  "resourceType": "User",
+  "resourceId": "admin@example.com",
+  "resourceName": null,
+  "oldValue": null,
+  "newValue": null,
+  "apiTokenName": null
+}
+```
+
+**Self-referential audit-log read (via API)** — every call to
+`GET /v1/audit-events` produces one of these; `newValue.eventCount` is the
+number of items that call returned (0 on empty pages, and yes, on the very
+call that produced this entry):
+
+```json
+{
+  "eventAction": "READ",
+  "eventDomain": "AUTHORIZATION",
+  "interactionType": "API",
+  "user": "admin@example.com",
+  "resourceType": "AuditEventList",
+  "resourceId": "great-rose-c73601",
+  "resourceName": "Audit Events",
+  "oldValue": null,
+  "newValue": { "eventCount": 10 },
+  "apiTokenName": "skill2"
+}
+```
+
+**Policy update (via WEB)** — `resourceId` is the `PolicySubType` slug (not a
+UUID), `resourceName` is typically `null`, and `oldValue`/`newValue` are the
+full policy document (rules + conditions + triggers), not a diff. The example
+below is truncated; a real policy body is easily 5–20 KB:
+
+```json
+{
+  "eventAction": "UPDATE",
+  "eventDomain": "POLICY",
+  "interactionType": "WEB",
+  "user": "admin@example.com",
+  "resourceType": "Policy",
+  "resourceId": "code_risk",
+  "resourceName": null,
+  "oldValue": {
+    "sub": "code_risk",
+    "rules": [ /* full rule tree before the edit */ ]
+  },
+  "newValue": {
+    "sub": "code_risk",
+    "rules": [ /* full rule tree after the edit */ ]
+  },
+  "apiTokenName": null
+}
+```
+
+> Policy-specific gotchas:
+> - Only `UPDATE` events exist for `POLICY` — policies are singletons per
+>   sub-type (`code_risk` | `secrets` | `global`), so you'll never see
+>   `CREATE` or `DELETE` in a healthy log.
+> - Roughly a quarter of `POLICY` UPDATEs in a live sample were no-ops
+>   (`oldValue == newValue`) from the UI's "Save" button.
+> - Filter for meaningful changes with e.g.:
+>   ```python
+>   import json
+>   real_changes = [
+>       e for e in items
+>       if e['eventDomain'] == 'POLICY'
+>       and json.dumps(e['oldValue'], sort_keys=True)
+>          != json.dumps(e['newValue'], sort_keys=True)
+>   ]
+>   ```
+
 ## Common Workflows
 
 ### Workflow 1: Analyze Security Findings
@@ -709,6 +956,7 @@ When triaging:
 - `sbom-api:write` - Upload SBOM scans
 - `policies:read` - View security policies
 - `status-checks:read` - View CI/CD status checks
+- `audit:read` - Read the organization audit-event log
 
 ## Error Handling
 
@@ -737,13 +985,13 @@ Error body shape (typical):
 
 The `id` field (e.g. `errid_80be5d1f-…`) is a server-side correlation id you can quote when reporting issues to Arnica support.
 
-> Note: Arnica does **not** appear to use HTTP `401` for invalid bearer tokens — it returns `403 Forbidden`. Don't write code that branches specifically on `401`.
+> Note: For most endpoints Arnica does **not** use HTTP `401` for invalid bearer tokens — it returns `403 Forbidden`. The one documented exception is `GET /v1/audit-events`, which returns `401` for a *missing* API key (but still `403` for an invalid key or a key missing `audit:read`). Outside audit-events, don't write code that branches specifically on `401`.
 
 ## Tips & Best Practices
 
 1. **Token Management**: Use environment variables, never commit tokens
 2. **Rate Limiting**: On `429` responses, back off with exponential delay + jitter (suggested: start at 1s, double on each retry, max 30s, cap at 5 retries). When fanning out parallel requests (e.g. paginated `expand=true` listings), keep concurrency bounded — 5 in-flight requests is a safe default.
-3. **Pagination**: Use `offset`/`limit` for `/v1/products` and `page`/`limit` for `/v1/risks/findings` (each endpoint's parameters are listed in its section above). Always paginate until a page is shorter than the requested limit.
+3. **Pagination**: Use `offset`/`limit` for `/v1/products` and `/v1/audit-events`, and `page`/`limit` for `/v1/risks/findings` (each endpoint's parameters are listed in its section above). For `/v1/audit-events` you can also page against the returned `total`; elsewhere, paginate until a page is shorter than the requested limit.
 4. **Filtering**: Filter on API side when possible, not in application
 5. **Scopes**: Request minimal required scopes for security
 6. **Error Responses**: Check response body for detailed error messages
