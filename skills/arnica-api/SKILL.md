@@ -3,8 +3,12 @@ name: arnica-api
 description: >-
   Reference for the Arnica security API: endpoints, auth, query params, error
   model, pagination, and the writable status enum. Use when calling Arnica
-  endpoints directly, querying findings, managing products/assets/owners,
-  scanning SBOMs, reviewing inventory, or integrating with the Arnica platform.
+  endpoints directly, querying or reporting on findings (SLA, severity,
+  per-product), reading product risk totals from the dashboard, applying
+  dismissals or severity overrides decided by an external process, tuning a
+  product's AI SAST prompt, managing
+  products/assets/owners, scanning SBOMs, reviewing inventory, or integrating
+  with the Arnica platform.
 ---
 
 # Arnica API Skill
@@ -22,7 +26,7 @@ model. Use this skill any time you need to call the Arnica API directly.
 - **API Base URL**: `https://api.app.arnica.io`
 - **API Documentation**: https://api.app.arnica.io/swagger
 - **API Version**: 1.0
-- **Authentication**: Bearer token
+- **Authentication**: Bearer token (OpenAPI `bearerFormat`: `arnica_{token}`)
 
 ## Authentication Setup
 
@@ -111,8 +115,15 @@ GET /v1/risks/findings/{id}
 # Query: status — see full enum below; common: requires_review, in_progress,
 #                 risk_accepted, resolved, resolved_automatically,
 #                 dismiss_not_accurate, dismiss_no_capacity, dismiss_risk_is_tolerable
-# See "Finding Triage & Review Workflow" below for full filter semantics.
+# Query: sla=true|false — finding HAS an SLA (slaStart set), NOT "SLA breached"
+# Query: product=<productId> — scope to one product
+# See "Finding filters" below for full semantics, and "Findings Query Playbook"
+# before pulling findings for a report.
 ```
+
+> Sorted by `lastUpdated` **descending**. Findings updated while you page can
+> shift between pages, so long pulls may see a duplicate or miss an item —
+> de-duplicate by `id`.
 
 #### Permission Risks (GitHub/Azure)
 ```bash
@@ -157,7 +168,10 @@ Content-Type: application/json
 # Writable statuses (from FindingUpdateDto.enum — narrower than the read enum):
 #   resolved, in_progress, requires_review, pending_review, risk_accepted,
 #   dismiss_no_capacity, dismiss_not_accurate, dismiss_risk_is_tolerable,
-#   dismiss_secret_not_used
+#   dismiss_secret_not_used, snooze
+#   (snooze: the body has no unsnooze-date field; the finding's `unsnoozeDate`
+#   and `snoozeReason` are read-only on responses. Confirm behavior before
+#   using it in automation.)
 #
 # DO NOT send these (read-only / system-managed):
 #   resolved_automatically, dismissed_automatically, awaiting_user_input,
@@ -180,6 +194,47 @@ Content-Type: application/json
 #     "https://api.app.arnica.io/v1/risks/$ENC/status"
 # Successful update returns HTTP 204 (no body).
 ```
+
+#### Override Finding Severity
+```bash
+PUT /v1/risks/{id}/severity
+Content-Type: application/json
+
+{
+  "severity": "low",
+  "reasonCategory": "compensating_control",
+  "note": "Only reachable from an internal admin tool"
+}
+
+# FindingSeverityUpdateDto:
+#   severity (required)       critical | high | medium | low | info
+#   reasonCategory (required) business_asset_context | compensating_control |
+#                             org_risk_policy | other
+#   note (optional, max 2000 chars; the UI requires one, so send one)
+# 204 on success. Re-overriding replaces the previous override; every change
+# is recorded in the finding's history.
+# 400 for SCA findings (their severity comes from the advisory; use the
+#     per-CVE override below), 403 if manual severity override is not enabled
+#     for the org, 404 if the finding doesn't exist.
+
+# Reset to the scanner-calculated severity
+DELETE /v1/risks/{id}/severity
+{ "reason": "Override no longer needed" }      # reason required, 1–2000 chars
+```
+
+#### Override a CVE's Severity (SCA)
+```bash
+PUT /v1/risks/{id}/cves/{cveId}/severity
+{ "severity": "low", "reasonCategory": "reachability", "note": "..." }
+# reasonCategory: same as above PLUS reachability | epss (CVE-level only)
+
+DELETE /v1/risks/{id}/cves/{cveId}/severity
+{ "reason": "..." }
+```
+
+> Same `{id}` rules as the status endpoint: use the finding `id`, URL-encoded.
+> All require `risks:write`. For applying decisions in bulk, see "Acting on
+> Findings".
 
 ### 2. Products Management
 
@@ -367,9 +422,33 @@ GET /v1/sbom/scan/{scanId}/status
 ```bash
 GET /v1/inventory/repos
 
-# Returns all connected repositories
+# Query parameters:
+# - offset: default 0, max 999999
+# - limit:  default 100, max 200
+# - integrationOrgId: only repos in this SCM org
+# - topic: only repos with this topic (max 100 chars)
 # Requires scope: inventory:read
 ```
+
+> Returns `{"items": [...]}`. Each item has `repositoryId` (Arnica's UUID — use
+> it for path exclusions), `repoId` (the SCM's own id), `name`, `fullName`,
+> `integrationType`, `integrationOrgId`, `organizationName`, `baseUrl`,
+> `webUrl`, `defaultBranch`, `visibility`.
+
+#### Repository Path Exclusions
+```bash
+GET /v1/inventory/repos/{repositoryId}/settings/path-exclusions   # inventory:read
+PUT /v1/inventory/repos/{repositoryId}/settings/path-exclusions   # inventory:write
+Content-Type: application/json
+
+{ "patterns": ["^docs/", "vendor/", "\\.generated\\."] }
+```
+
+> **PUT replaces the whole list** (max 10 regex patterns). To add one, GET the
+> current list, append, and PUT the combined array; `[]` clears all. Side
+> effects: open findings matching a pattern are auto-resolved, findings
+> auto-resolved by a removed pattern reopen, and a rescan is triggered.
+> Confirm with the user before calling PUT.
 
 ### 7. Security Policies
 
@@ -658,15 +737,126 @@ below is truncated; a real policy body is easily 5–20 KB:
 >   ]
 >   ```
 
+### 10. Dashboard: Product Risk Totals
+
+The same per-product counts the Arnica risks dashboard shows. One call returns
+every product, which makes it the cheapest way to see where the risk is before
+pulling findings. See "Findings Query Playbook" below.
+
+#### List Product Risk Totals
+```bash
+GET /v1/dashboard/product-risk-totals
+
+# Query parameters:
+# - minSeverity: critical | high | medium | low   (default: high)
+# - minBusinessImportance: high | medium | low   (default: medium)
+# - limit: products per page, 1–1000 (default 100)
+# - sortBy: importance | name | SCA | SAST | SECRET | IAC | LICENSE | REPUTATION
+#           (default importance; a risk type ranks by worst-severity finding
+#           of that type)
+# - sortOrder: asc | desc (default desc for importance, asc otherwise; for a
+#              risk-type sort, asc puts the riskiest products first)
+# - cursor: opaque value from the previous response's nextCursor
+# Requires scope: dashboard:read
+```
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "id": "923660c8-…",
+      "name": "payments-api",
+      "businessImportance": "high",
+      "riskTotals": {
+        "sast":       { "critical": 3, "high": 19, "medium": 4 },
+        "sca":        { "critical": 0, "high": 0,  "medium": 0 },
+        "secret":     { "critical": 0, "high": 13, "medium": 0 },
+        "iac":        { "critical": 0, "high": 0,  "medium": 0 },
+        "license":    { "critical": 0, "high": 0,  "medium": 0 },
+        "reputation": { "critical": 0, "high": 0,  "medium": 0 }
+      }
+    }
+  ],
+  "snapshotDate": "2026-10-10T00:00:00.000Z",
+  "nextCursor": null
+}
+```
+
+> Gotchas:
+> - **The defaults hide data.** `minBusinessImportance` defaults to `medium`,
+>   so low-importance products are left out (on one live tenant: 19 products
+>   by default, 75 with `minBusinessImportance=low`). `minSeverity` defaults
+>   to `high`, so mediums are left out. Set both explicitly.
+> - Severity buckets below `minSeverity` are **omitted**, not zero. A missing
+>   key means "filtered out", not "zero".
+> - Counts come from the **latest daily snapshot** (`snapshotDate`), not live
+>   data. They're for sizing and ranking, not exact counts: on a live tenant a
+>   product showing 273 had 236 open findings at the same severities. Report
+>   numbers from the findings endpoint.
+> - Paginate with `cursor` until `nextCursor` is `null`. Restart without
+>   `cursor` if you change `sortBy`/`sortOrder`.
+
+#### Get Risk Totals for One Product
+```bash
+GET /v1/dashboard/product-risk-totals/product?productId=<uuid>&minSeverity=medium
+GET /v1/dashboard/product-risk-totals/product?productName=payments-api
+```
+
+> Pass `productId`, `productName` (case-insensitive exact match), or both
+> (they must match the same product). Returns `{ "item": {...}, "snapshotDate" }`.
+> Ignores business importance. `400` if neither is given or the name matches
+> several products (use `productId`), `404` if nothing matches.
+
+### 11. Product Issue Rules & AI SAST Prompt
+
+```bash
+# Issue rules: auto-create tickets for a product's findings
+GET    /v1/products/{productId}/issues                 # products:read, offset/limit (max 200)
+POST   /v1/products/{productId}/issues                 # products:write
+PATCH  /v1/products/{productId}/issues/{issueRuleId}   # products:write
+DELETE /v1/products/{productId}/issues/{issueRuleId}   # products:write
+
+# IssueRuleCreate: integrationType (jira | jira-datacenter |
+#   azure-devops-boards | linear), integrationId, projectId (Jira project key
+#   or ADO project UUID), issueTypeId, openStatusId, closedStatusId, fields[]
+#   (field mappings). See the Swagger schema for the full field-mapping shape.
+
+# AI SAST: extra prompt appended to AI SAST scans for one product
+GET /v1/products/{productId}/ai-sast/prompt    # products:read
+PUT /v1/products/{productId}/ai-sast/prompt    # products:write
+{ "prompt": "Treat the security-engineering package as trusted input sanitization." }
+# max 10000 chars, trimmed, must not be empty
+# GET returns { id, productId, prompt }. 404 has two meanings, told apart by
+#   the body's message (verified live):
+#   "No AI SAST prompt configured for this product." → product exists, no prompt
+#   "Product not found."                               → bad product id
+#   (a productId that isn't a UUIDv4 → 400 "productId must be a UUIDv4.")
+# PUT returns 200 with the same shape and REPLACES the whole prompt (no append)
+```
+
+See "Acting on Findings" for how to update the prompt from triage results.
+
+### Not covered here
+
+- `/v1/groups*`: deprecated, replaced by `/v1/products`. Don't use.
+- `/v1/risks/ondemand-scan-oauth/*`: OAuth-based on-demand scan endpoints
+  (validate, scan an archive, get findings for a repo URL). They use an OAuth
+  JWT, not an API key, and their request schemas are empty in the OpenAPI.
+  Check the Swagger before using them.
+
 ## Common Workflows
 
 ### Workflow 1: Analyze Security Findings
 ```
-1. GET /v1/risks/findings
-2. Filter by severity and type
-3. GET /v1/risks/findings/{id} (detailed info)
+1. GET /v1/dashboard/product-risk-totals (size the problem, pick products)
+2. GET /v1/risks/findings with server-side filters (status, severity, sla,
+   type, product), no expand
+3. GET /v1/risks/findings/{id}?expand=true only for the findings that need details
 4. PUT /v1/risks/{id}/status (update status — OpenAPI calls the path param {sortKey}, but use the finding's `id` field)
 ```
+Follow "Findings Query Playbook" below for steps 1–3.
 
 ### Workflow 2: Create and Manage Product
 ```
@@ -691,6 +881,421 @@ below is truncated; a real policy body is easily 5–20 KB:
 3. Add missing repos via POST /v1/products/{id}/assets
 4. Update product coverage
 ```
+
+## Findings Query Playbook
+
+Use this whenever the user asks for findings ("show me our criticals",
+"what's open in payments", "export findings with SLA"). The findings endpoint
+has no total count, pages are capped at 100 (20 with `expand`), and an
+org-wide pull can be large: 14,376 findings took **108 s** sequentially on one
+live tenant. Working out what the customer needs first, and filtering on the
+server, keeps this fast.
+
+### Step 1: Work out what the customer needs
+
+Answer these from the request. Ask only when an answer changes the query and
+can't be inferred. Otherwise use the defaults and say which ones you used.
+
+| Question | Query parameter | Default when not stated |
+|---|---|---|
+| Which statuses? | `status=` (repeatable) | Open: `requires_review`, `pending_review`, `in_progress`, `awaiting_user_input`, `mitigation_in_progress`, `mitigation_pending_pr`, `mitigation_failed` |
+| Only findings under SLA? | `sla=true` | `sla=true` for SLA, compliance, or exec reporting. Omit for triage or "everything" |
+| Which severities? | `severity=` (repeatable) | `critical`, `high`, `medium`. Add `low` only if asked. Skip `info`/`unknown` |
+| Which finding types? | `type=` (repeatable) | All. `SECRET` findings often go to a different team, so ask if the audience is unclear |
+| Which products? | `product=<id>` (one per call) | Decide in step 2 |
+| One repo/branch? | `asset=` | Only when the user names a repo or works in a checkout |
+| Need descriptions, code, CVEs, fix guidance? | `expand=true` | **No.** See step 3 |
+
+Typical requests:
+
+- **"SLA report" / "what's at risk of breaching"**: `status=<open>&sla=true&severity=critical&severity=high&severity=medium`. Use `slaStart` to compute age and compare it with the org's SLA windows. There is no breach filter.
+- **"Criticals and highs for product X"**: resolve X to an id with `GET /v1/products?name=X`, then `product=<id>&status=<open>&severity=critical&severity=high`.
+- **"Vulnerable dependencies with CVEs"**: `type=SCA&status=<open>`, then expand only the findings you'll show to get `details.vulnerabilities`.
+- **"Is anything linked to Jira?"**: no expand needed. `issue` is on every finding.
+
+### Step 2: Look at product risk totals first
+
+Before pulling findings, make one call to see where the risk is:
+
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "https://api.app.arnica.io/v1/dashboard/product-risk-totals?minSeverity=medium&minBusinessImportance=low&limit=1000"
+```
+
+Set `minSeverity` to the lowest severity the user asked for and
+`minBusinessImportance=low`, or products will be missing (see the gotchas in
+section 10). Sum `riskTotals` per product over the requested types, then decide:
+
+- **Per-product pulls** (preferred): when the user named products, or when
+  risk is concentrated (a handful of products hold most of the total). Show
+  the user the top products and their totals, and offer to focus on those.
+  Per-product pulls are faster in parallel and give a grouped view.
+- **One org-wide pull**: when the user wants the whole org and the totals
+  are small (roughly under 2,000 matching findings), or when findings outside
+  any product matter. Per-product pulls only return findings in repos that
+  belong to a product. Every finding has `product: {id, name}` (or `null`),
+  so you can still group an org-wide pull by product.
+
+The totals are a daily snapshot and run higher than live open counts. Use
+them to choose and rank products, and report numbers from the findings
+endpoint.
+
+### Step 3: Decide on `expand`
+
+`expand=true` only adds `details` (see "Response format"). It caps pages at
+20 and, measured live, was 3.6× slower with 4× the payload for the same
+findings. Default to **no expand**.
+
+| Needed for the answer | Expand? |
+|---|---|
+| Counts, grouping by severity/type/product/repo, SLA age, owners, links, ticket status, CVSS, reachability, title | No |
+| Description, vulnerable code snippet, CWE/OWASP, recommendation | Yes |
+| SCA CVE ids or fixed versions (`details.vulnerabilities`, `recommendedV2`) | Yes |
+| Secret verification/access details | Yes |
+
+When expand is needed, list without it first, then expand only what you'll
+show: `GET /v1/risks/findings/{id}?expand=true` for a short list, or the
+filtered list with `expand=true` when you need most of a small product.
+
+### Step 4: Pull products in parallel, 10 at a time
+
+Each product's pages are fetched in order (there's no total, so you page
+until a short page), but products are independent. Run up to 10 products at
+once. Measured live, 10 products (3,454 findings) took 24.3 s one after
+another and 5.3 s 10 at a time, with no `429`s. Process the product list in
+chunks of 10 and keep the 429 backoff from "Tips & Best Practices".
+
+```python
+import os, json, re, time, random, urllib.error, urllib.parse, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+TOKEN = re.search(r"^TOKEN=(.*)$", open(os.path.expanduser("~/.arnica/.prod.env")).read(), re.M).group(1)
+BASE = "https://api.app.arnica.io"
+OPEN = ["requires_review", "pending_review", "in_progress", "awaiting_user_input",
+        "mitigation_in_progress", "mitigation_pending_pr", "mitigation_failed"]
+
+def get(path, params):
+    url = f"{BASE}{path}?{urllib.parse.urlencode(params, doseq=True)}"
+    for attempt in range(6):
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or attempt == 5:
+                raise
+            time.sleep(min(30, 2 ** attempt) + random.random())
+
+def findings(filters, expand=False):
+    limit, page, out = (20 if expand else 100), 1, {}
+    while True:
+        params = {**filters, "limit": limit, "page": page}
+        if expand:
+            params["expand"] = "true"
+        batch = get("/v1/risks/findings", params)
+        out.update({f["id"]: f for f in batch})       # dedupe: pages can shift
+        if len(batch) < limit:
+            return list(out.values())
+        page += 1
+
+# 1. Rank products by matching risk
+severities = ["critical", "high", "medium"]
+totals, cursor = [], None
+while True:
+    params = {"minSeverity": severities[-1], "minBusinessImportance": "low", "limit": 1000}
+    if cursor:
+        params["cursor"] = cursor
+    resp = get("/v1/dashboard/product-risk-totals", params)
+    totals += resp["items"]
+    cursor = resp["nextCursor"]
+    if not cursor:
+        break
+score = lambda p: sum(n for t in p["riskTotals"].values() for s, n in t.items() if s in severities)
+products = sorted((p for p in totals if score(p) > 0), key=score, reverse=True)
+
+# 2. Pull findings per product, 10 products at a time
+filters = {"status": OPEN, "severity": severities, "sla": "true"}
+results = {}
+for i in range(0, len(products), 10):
+    chunk = products[i:i + 10]
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for p, items in zip(chunk, pool.map(lambda p: findings({**filters, "product": p["id"]}), chunk)):
+            results[p["name"]] = items
+
+for name, items in results.items():
+    by_sev = {s: sum(f["severity"] == s for f in items) for s in severities}
+    print(name, len(items), by_sev)
+```
+
+If the user asked about specific products, skip step 1 and pass their ids.
+If they only want the top N products, slice `products[:N]` before step 2.
+
+On the live tenant this script pulled 14,074 findings across 74 products in
+about 16 s. An org-wide sequential pull with the same filters took 108 s and
+returned 14,376. The ~300 extra findings are in repos that belong to no
+product. If the user wants org-wide totals, say so, or also run the org-wide pull
+and keep the findings whose `product` is `null` (there is no server-side
+filter for that). De-duplicate by `id` when merging.
+
+## Acting on Findings: Dismissals, Severity Overrides, and AI SAST Prompt Tuning
+
+Use this when something outside this skill decides what to do with findings
+and the API carries it out. That might be a customer's own triage service, an
+LLM classifier, a reachability or exploitability engine, or the `arnica-fix`
+skill. The API has no approval step: each call takes effect immediately, so
+the decisions arrive already made.
+
+| | Use case A + B: per-finding updates | Use case C: product AI SAST prompt |
+|---|---|---|
+| Scope | One finding at a time | One product, aggregated across all findings handled |
+| What you send | A status or severity change, with a **reason that gives the finding's context** | **Directives** for the next scans: what to apply or avoid |
+| Who reasons | Arnica reasons from the context you give | You've already reasoned; Arnica follows the instructions |
+| When | Applied as decided, failing open | **Only after the user says yes** |
+
+### Use case A: Apply an external process's decisions
+
+**1. Pull the candidates** with the Findings Query Playbook (filters, per
+product, no expand unless the decision engine needs `details`). Keep the
+listing: its `status`/`severity` are the "before" values for the summary.
+
+**2. Get decisions back in a fixed format**, one record per finding. The
+`reason`/`note` follows use case B:
+
+```json
+[
+  {"id": "<finding id>", "action": "status",
+   "status": "dismiss_not_accurate",
+   "reason": "The `q` parameter is passed through `@acme/sql-guard` escapeIdentifier() in src/db/query.ts:41 before reaching the query builder, so it can't carry SQL syntax."},
+  {"id": "<finding id>", "action": "severity",
+   "severity": "low", "reasonCategory": "compensating_control",
+   "note": "admin-tools is deployed only to the internal cluster behind the corporate VPN and Okta SSO (deploy/helm/values-prod.yaml); the endpoint isn't reachable from the internet."},
+  {"id": "<SCA finding id>", "action": "cve_severity", "cveId": "CVE-2021-23337",
+   "severity": "low", "reasonCategory": "reachability",
+   "note": "Only lodash.get and lodash.merge are imported (src/utils/*.ts); the vulnerable template() function is never called."}
+]
+```
+
+**3. Map each decision to the right call.** The status you pick tells the
+next reader *why*, so use the most specific one:
+
+| Decision | Call | Value |
+|---|---|---|
+| False positive (the scanner was wrong) | `PUT /v1/risks/{id}/status` | `dismiss_not_accurate` |
+| Real but the risk is acceptable as is, nothing will be done | status | `dismiss_risk_is_tolerable` |
+| Real, accepted by an owner | status | `risk_accepted` |
+| Real, but no capacity to fix now | status | `dismiss_no_capacity` |
+| Secret is not in use (SECRET findings only) | status | `dismiss_secret_not_used` |
+| Defer and reopen later | status | `snooze` (no unsnooze date in the body; check the behavior in the UI first) |
+| Send back for human triage | status | `requires_review` / `pending_review` |
+| Real, should stay tracked, but impact is lower (or higher) in this context. **Not SCA** | `PUT /v1/risks/{id}/severity` | `severity` + `reasonCategory`: `business_asset_context`, `compensating_control`, `org_risk_policy`, `other` |
+| SCA: a specific CVE is unreachable or unlikely to be exploited | `PUT /v1/risks/{id}/cves/{cveId}/severity` | `reasonCategory`: `reachability` or `epss` (plus the four above). The finding's severity is then re-derived from its CVEs |
+
+Prefer a **severity override** over a dismissal when the finding is real: it
+stays visible and keeps its SLA. Dismiss only when nobody will act on it.
+
+**4. Apply, failing open.** Process every record. Never stop the run on a
+bad record or a failed call. Record the result and move on:
+
+- **Skip without calling** (reported as `skipped`) when a record can't
+  succeed: `status` outside the write enum, `severity` outside
+  `critical | high | medium | low | info`, a `reasonCategory` that doesn't
+  match the endpoint (`reachability`/`epss` are CVE-only), an empty
+  `reason`, a finding-level `severity` action on an SCA finding, or a
+  `cve_severity` action on a non-SCA finding.
+- **Call, and record failures** (reported as `failed`) with the HTTP code
+  and the `message` from the error body. Expect `400` (invalid body or
+  ineligible finding), `403` (key lacks `risks:write`, or manual severity
+  override isn't enabled for the org), and `404` (finding or CVE not found).
+- Retry only `429`, with backoff. Keep at most 5 calls in flight.
+- Success is `204` (reported as `changed`).
+
+```python
+import json, time, random, urllib.parse, urllib.request, urllib.error
+from collections import Counter
+
+WRITE_STATUSES = {"resolved", "in_progress", "requires_review", "pending_review", "risk_accepted",
+                  "dismiss_no_capacity", "dismiss_not_accurate", "dismiss_risk_is_tolerable",
+                  "dismiss_secret_not_used", "snooze"}
+SEVERITIES = {"critical", "high", "medium", "low", "info"}
+REASONS = {"business_asset_context", "compensating_control", "org_risk_policy", "other"}
+
+def call(method, path, body, token):
+    req = urllib.request.Request(
+        f"https://api.app.arnica.io{path}", method=method, data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, None
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 5:
+                time.sleep(min(30, 2 ** attempt) + random.random())
+                continue
+            try:
+                msg = json.loads(e.read()).get("message")
+            except Exception:
+                msg = None
+            return e.code, msg
+        except urllib.error.URLError as e:
+            return None, str(e.reason)
+
+def plan(d, finding):
+    """Return (method, path, body) or raise ValueError(reason to skip)."""
+    enc = urllib.parse.quote(d["id"], safe="")
+    is_sca = finding.get("type") == "SCA"
+    if d["action"] == "status":
+        if d.get("status") not in WRITE_STATUSES or not d.get("reason"):
+            raise ValueError("invalid status or empty reason")
+        return "PUT", f"/v1/risks/{enc}/status", {"status": d["status"], "reason": d["reason"]}
+    body = {k: d[k] for k in ("severity", "reasonCategory", "note") if d.get(k)}
+    if d.get("severity") not in SEVERITIES:
+        raise ValueError("invalid severity")
+    if d["action"] == "severity":
+        if is_sca:
+            raise ValueError("finding-level severity override isn't allowed on SCA; use cve_severity")
+        if d.get("reasonCategory") not in REASONS:
+            raise ValueError("invalid reasonCategory")
+        return "PUT", f"/v1/risks/{enc}/severity", body
+    if d["action"] == "cve_severity":
+        if not is_sca or not d.get("cveId"):
+            raise ValueError("cve_severity needs an SCA finding and a cveId")
+        if d.get("reasonCategory") not in REASONS | {"reachability", "epss"}:
+            raise ValueError("invalid reasonCategory")
+        cve = urllib.parse.quote(d["cveId"], safe="")
+        return "PUT", f"/v1/risks/{enc}/cves/{cve}/severity", body
+    raise ValueError(f"unknown action {d['action']!r}")
+
+def apply(decisions, findings_by_id, token):
+    results = []
+    for d in decisions:
+        f = findings_by_id.get(d["id"], {})
+        r = {"id": d["id"], "action": d["action"], "product": (f.get("product") or {}).get("name"),
+             "title": f.get("title"), "before": {"status": f.get("status"), "severity": f.get("severity")},
+             "after": {k: d[k] for k in ("status", "severity", "cveId") if k in d}}
+        try:
+            method, path, body = plan(d, f)
+        except (ValueError, KeyError) as e:
+            results.append({**r, "outcome": "skipped", "error": str(e)})
+            continue
+        code, msg = call(method, path, body, token)
+        results.append({**r, "outcome": "changed" if code == 204 else "failed", "http": code, "error": msg})
+    return results
+
+def summarize(results):
+    print(Counter(r["outcome"] for r in results))
+    changed = [r for r in results if r["outcome"] == "changed"]
+    print("changed by action/value:", Counter((r["action"], r["after"].get("status") or r["after"].get("severity")) for r in changed))
+    print("changed by product:", Counter(r["product"] for r in changed))
+    for r in results:
+        if r["outcome"] != "changed":
+            print(r["outcome"], r.get("http"), r["id"], "-", r["error"])
+```
+
+**5. Summarize for the user**: counts of changed / failed / skipped; what
+changed, grouped by action and new value, by product, and before → after
+for severity changes; and every failed or skipped finding with its id, title,
+and the error or skip reason, so it can be fixed and resent. End with the
+developer feedback loop callout from use case B for every product that had
+dismissals.
+
+Use a dedicated API key for each automation so its changes can be told apart
+from human ones.
+
+### Use case B: Explain the finding's context in the reason
+
+The `reason` (status) or `note` (severity) is where you tell Arnica **why**,
+so it can reason about this finding and similar ones. Write it about the
+finding's context only, the facts that make it not exploitable or less
+severe *here*:
+
+- **A security control in the code:** "Input to `render()` goes through
+  `@acme/html-sanitizer` sanitize() (src/web/render.ts:22), which strips
+  script and event-handler attributes."
+- **Deployment environment with compensating controls:** "The service runs
+  only in the internal `ops` cluster behind the VPN and mTLS
+  (deploy/k8s/ops/ingress.yaml); there is no public ingress."
+- **Unreachable path:** "`scripts/migrate_2019.py` is a one-off migration
+  that isn't packaged in the Docker image (see .dockerignore) and never runs
+  in production."
+- **Unreachable vulnerable code (SCA):** "Only `yaml.safe_load` is used
+  (grep across src/); the vulnerable `yaml.load` path is never called."
+
+Rules:
+- State the context and point to the evidence (file, package, config,
+  environment). Don't stop at a verdict: "false positive" or "not
+  exploitable" on its own gives Arnica nothing to reason with.
+- Keep it about the finding. Leave out process details (who decided, run
+  ids, ticket numbers, team names) and anything unrelated to why this
+  finding is or isn't a risk.
+- Don't tell Arnica what to do in the reason ("stop reporting this"). That's
+  use case C.
+- No secrets, credentials, tokens or customer data in the text.
+
+> **When you're done: examine the developer feedback loop in each affected product.**
+> After use case B, or any run that dismisses findings (any `dismiss_*`
+> status, `risk_accepted`, `snooze`, or a severity downgrade), tell the user
+> to review the developer feedback loop in Arnica for every product that had
+> dismissals. List those products and the number of dismissals in each. This
+> is a callout in your response, not an API action. The context that
+> justified the dismissals usually means developers in that product are
+> getting, or will get, the same signal again: PR comments, status checks,
+> notifications and linked tickets. The user should check whether that
+> feedback is still accurate and useful for the product. If the same context
+> explains many dismissals, also point them to use case C.
+
+### Use case C: Turn aggregated learnings into the product's AI SAST prompt
+
+After a run, look at **all the findings handled in one product** and their
+use case B reasons. When the same context explains several of them, turn it
+into an instruction in the product's AI SAST prompt, so future scans apply
+it from the start. B gives Arnica context and lets it reason. C is the
+conclusion: it tells Arnica specifically what to apply or avoid.
+
+1. **Aggregate per product.** Group the run's results by `product` and,
+   within a product, by shared cause (the same sanitizer package, the same
+   deployment control, the same unreachable path). One finding is an
+   anecdote. Several findings with the same cause make a learning.
+2. **Write each learning as a scoped directive** saying what to apply or
+   avoid, where, and why:
+   - "Treat `@acme/sql-guard` escapeIdentifier()/escapeValue() as SQL
+     sanitizers. Don't report SQL injection where the tainted value passes
+     through them before reaching the query."
+   - "Don't report findings under `scripts/migrations/`. These are one-off
+     scripts excluded from the production image."
+   - "Services under `services/admin-*` run only on the internal cluster
+     behind VPN + SSO. Lower internet-exposure findings there to low unless
+     they allow authentication bypass."
+   - "Apply extra scrutiny to `api/public/`. It's internet-facing and
+     handles payment data."
+   Scope every directive to a package, path, service or environment. Never
+   write blanket suppressions ("don't report SQL injection").
+3. **Read the current prompt:** `GET /v1/products/{productId}/ai-sast/prompt`
+   → `{id, productId, prompt}`. A `404` can mean two things. Tell them apart
+   by `message`:
+   - `"No AI SAST prompt configured for this product."` → start from an
+     empty prompt.
+   - `"Product not found."` → wrong product id; skip this product.
+4. **Merge.** PUT replaces the whole prompt, so build the full new text:
+   keep every existing instruction (including non-learning ones, such as
+   formatting requirements for finding descriptions), add the new
+   directives, and flag any directive that contradicts an existing line
+   instead of silently replacing it. Remove duplicates. The result must be
+   under 10,000 characters and non-empty after trimming.
+5. **Ask the user whether to apply it.** For each product, show the current
+   prompt, the proposed prompt (or a diff), and for each new directive the
+   number of findings and a short summary of the evidence behind it. Apply
+   only the products the user approves. They may edit or drop directives.
+6. **Apply** with `PUT /v1/products/{productId}/ai-sast/prompt` and
+   `{"prompt": "<merged text>"}`. `200` returns the saved prompt. Same
+   fail-open rule as use case A: record failures, continue with the next
+   product, and include them in the summary.
+7. **Set expectations.** The prompt affects future AI SAST scans of that
+   product only. Existing findings are changed by use case A, not by the
+   prompt. After the next scan, check that the targeted noise is gone and
+   that real issues in the same areas are still reported.
+
+Don't copy one product's directives into another product's prompt unless the
+user confirms the same context holds there.
 
 ## Finding Triage & Review Workflow
 
@@ -830,10 +1435,10 @@ Use exact match filters when querying findings. Full query-parameter list (from 
 
 - `severity=critical|high|medium|low|info|unknown` (exact match — `info` is informational, `unknown` is the scanner's "couldn't determine"; both are typically excluded from triage workflows)
 - `type=SAST|SCA|IAC|LICENSE|REPUTATION|SECRET` (uppercase)
-- `status=<FindingStatuses>` — see "Safe status updates" below for the full enum; use `requires_review` to focus on actionable issues
+- `status=<FindingStatuses>` — see "Safe status updates" below for the full enum; use `requires_review` to focus on actionable issues, or the open set in "Findings Query Playbook"
 - `asset=<asset-string>` to scope to a specific repo/branch
 - `product=<productId>` to scope to all assets of a product
-- `sla=<bool>` to filter by SLA breach
+- `sla=<bool>` — **whether the finding has an SLA**, not whether it's breached. Verified live: `sla=true` returns only findings with a non-null `slaStart`; `sla=false` returns only findings with `slaStart: null`. There is no "breached" filter; compute it client-side from `slaStart` plus your org's SLA window
 - `secretType=...` and `secretValidation=...` for secret-finding refinement
 - `expand=true` for full details (caps page size at 20)
 - `page` / `limit` for pagination
@@ -846,9 +1451,16 @@ severity=critical&severity=high&type=SAST&type=SCA
 
 ### Expand and pagination
 
-`limit` defaults to **20** and is capped at **100** server-side (values above 100 are silently clamped, not rejected). `page` defaults to **1**.
+`limit` defaults to **20** and is capped at **100** server-side (values above 100 are silently clamped, not rejected). `limit=100` works even though the OpenAPI marks 100 as an exclusive maximum. `page` defaults to **1**.
 
 When `expand=true`, the page size is further capped at **20** regardless of what you send for `limit`.
+
+**`expand=true` adds exactly one field: `details`.** Everything else (title,
+severity, status, type, asset, product, SLA fields, permalink, reachability,
+CVSS, linked issue) is already on the non-expanded response. Measured on a live
+tenant: one expanded finding is ~23× larger; pulling the same 235 findings took
+7.2 s expanded and 2.0 s non-expanded. See "Findings Query Playbook" for when
+expand is worth it.
 
 Always page through results until the returned page is shorter than the requested limit (i.e. `len(page) < limit` ⇒ last page). Don't rely on a total/count in the response — there isn't one.
 
@@ -884,13 +1496,26 @@ The `asset` object on each finding has this shape (verified against live respons
 
 Use `asset.path`, `asset.repo`, and `asset.branch` to correlate findings to source code, and `asset.link` for a direct deep link.
 
-When `expand=true`, findings may include a `details` object with fields such as:
-- `description`
-- `code`
-- `ruleId`
-- `references`
-- `package`, `packageType`, `version`
-- `recommendation`
+Fields on every finding **without** `expand` (verified live): `id`, `title`,
+`type`, `severity`, `status`, `asset`, `product` (`{id, name}` or `null`),
+`firstDetected`, `lastDetected`, `lastUpdated`, `resolvedAt`, `slaStart`,
+`slaTimeToRemediationInMinutes`, `timeToRemediationInMinutes`, `permalink`,
+`issue` (`{type, key, url}` of a linked Jira/ADO ticket, or `null`),
+`reachability`, `highestCvssScore`, `vulnerabilityClass`, `checkId`,
+`codeLanguage`, `lineNumber`, `isAiSast`, `isAiAdjusted`, `isDevDependency`,
+`hasDirectVulnerabilities`, `latestVersion`, `dismissalReason`,
+`snoozeReason`, `unsnoozeDate`, `activity`, `detectedIn`, `scannedIn`.
+
+With `expand=true`, findings also include a `details` object. Its keys depend on `type` (verified live):
+
+| Type | `details` keys |
+|---|---|
+| SAST | `description`, `code`, `ruleId`, `cwe`, `owasp`, `references`, `recommendation` |
+| SCA | `description`, `package`, `packageType`, `version`, `vulnerabilities` (CVE list), `recommendedV2` |
+| IAC | `description`, `code`, `reference` |
+| SECRET | `description`, `type`, `verification`, `accessed` |
+| LICENSE | `description`, `package`, `packageType`, `licenses`, `preferred` |
+| REPUTATION | `description`, `package`, `packageType`, `openssf`, `stars`, `weeklyDownloads`, `releases`, `dependents`, `firstPublished`, `lastPublished` |
 
 ### Safe status updates
 Use the findings status endpoint carefully:
@@ -917,7 +1542,7 @@ Content-Type: application/json
 Two related enums exist:
 
 **`FindingStatuses`** (read enum — what you may see on a finding):
-`requires_review`, `pending_review`, `in_progress`, `awaiting_user_input`,
+`requires_review`, `pending_review`, `in_progress`, `snooze`, `awaiting_user_input`,
 `risk_accepted`, `resolved`, `resolved_automatically`,
 `dismissed_automatically`, `dismiss_no_capacity`, `dismiss_not_accurate`,
 `dismiss_risk_is_tolerable`, `dismiss_secret_not_used`,
@@ -934,11 +1559,13 @@ Two related enums exist:
 - `dismiss_not_accurate`
 - `dismiss_risk_is_tolerable`
 - `dismiss_secret_not_used`
+- `snooze`
 
 Anything in the read enum but not the write enum is system-managed and cannot be set via the API (e.g. `*_automatically`, `awaiting_user_input`, `mitigation_*`, `dismiss_no_option_chosen_yet`).
 
 ### Approval / triage guidance
 For code-review and triage workflows, always verify findings before changing status.
+For bulk or automated changes, follow "Acting on Findings" above.
 When triaging:
 - classify findings by severity and type
 - review source correlation and `details`
@@ -951,12 +1578,14 @@ When triaging:
 - `risks:write` - Update finding status
 - `products:read` - List/view products
 - `products:write` - Create/update/delete products
-- `inventory:read` - View repository inventory
+- `inventory:read` - View repository inventory and path exclusions
 - `sbom-api:read` - Check SBOM scan status
 - `sbom-api:write` - Upload SBOM scans
 - `policies:read` - View security policies
 - `status-checks:read` - View CI/CD status checks
 - `audit:read` - Read the organization audit-event log
+- `dashboard:read` - Read product risk totals (`/v1/dashboard/*`)
+- `inventory:write` - Replace repository path exclusions
 
 ## Error Handling
 
@@ -990,9 +1619,9 @@ The `id` field (e.g. `errid_80be5d1f-…`) is a server-side correlation id you c
 ## Tips & Best Practices
 
 1. **Token Management**: Use environment variables, never commit tokens
-2. **Rate Limiting**: On `429` responses, back off with exponential delay + jitter (suggested: start at 1s, double on each retry, max 30s, cap at 5 retries). When fanning out parallel requests (e.g. paginated `expand=true` listings), keep concurrency bounded — 5 in-flight requests is a safe default.
+2. **Rate Limiting**: On `429` responses, back off with exponential delay + jitter (suggested: start at 1s, double on each retry, max 30s, cap at 5 retries). When fanning out parallel requests, keep concurrency bounded: up to 10 in-flight requests for per-product findings pulls (see "Findings Query Playbook"), 5 for anything else.
 3. **Pagination**: Use `offset`/`limit` for `/v1/products` and `/v1/audit-events`, and `page`/`limit` for `/v1/risks/findings` (each endpoint's parameters are listed in its section above). For `/v1/audit-events` you can also page against the returned `total`; elsewhere, paginate until a page is shorter than the requested limit.
-4. **Filtering**: Filter on API side when possible, not in application
+4. **Filtering**: Filter on API side when possible, not in application. Skip `expand=true` unless you need `details`
 5. **Scopes**: Request minimal required scopes for security
 6. **Error Responses**: Check response body for detailed error messages
 7. **Testing**: Start with GET requests to validate token and connectivity
@@ -1012,14 +1641,21 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# Get all findings (note: response is a flat JSON array, not a wrapped object)
-response = requests.get(
-    f"{BASE_URL}/v1/risks/findings",
-    headers=headers,
-    params={"status": "requires_review", "limit": 20, "page": 1},
-)
-response.raise_for_status()
-findings = response.json()  # list[dict]
+# Page through findings (response is a flat JSON array, not a wrapped object;
+# there is no total, so stop on a short page)
+findings, page = [], 1
+while True:
+    response = requests.get(
+        f"{BASE_URL}/v1/risks/findings",
+        headers=headers,
+        params={"status": "requires_review", "limit": 100, "page": page},
+    )
+    response.raise_for_status()
+    batch = response.json()  # list[dict]
+    findings += batch
+    if len(batch) < 100:
+        break
+    page += 1
 
 # Group by severity (API returns lowercase severities)
 by_severity = {}
